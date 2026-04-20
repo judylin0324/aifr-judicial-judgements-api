@@ -150,6 +150,37 @@ def box_stats(values):
 
 
 # ════════════════════════════════════════════════════════════
+#  Stacked Bar Helper
+# ════════════════════════════════════════════════════════════
+def _build_stacked_bar(df, group_col, segment_col, top_n=8):
+    """Build stacked bar data: top N groups, each broken into segment proportions."""
+    filtered = df[(df[group_col].str.strip() != "") & (df[segment_col].str.strip() != "")]
+    if filtered.empty:
+        return {"data": [], "segments": []}
+
+    segments = [s for s, _ in Counter(filtered[segment_col]).most_common()]
+    top_groups = [g for g, _ in Counter(filtered[group_col]).most_common(top_n)]
+
+    data = []
+    for group in top_groups:
+        sub = filtered[filtered[group_col] == group]
+        total = len(sub)
+        cats = sub[segment_col].value_counts().to_dict()
+        row = {"name": group, "__total": total, "__counts": {s: cats.get(s, 0) for s in segments}}
+        acc = 0
+        for i, s in enumerate(segments):
+            if i < len(segments) - 1:
+                t = round((cats.get(s, 0) / total) * 1000) if total else 0
+                row[s] = t
+                acc += t
+            else:
+                row[s] = 1000 - acc
+        data.append(row)
+
+    return {"data": data, "segments": segments}
+
+
+# ════════════════════════════════════════════════════════════
 #  Common Filter Application
 # ════════════════════════════════════════════════════════════
 def get_ym_key(row):
@@ -491,10 +522,25 @@ def apply_civil_filters(df, params):
         val = params.get(param_key)
         if val and col in result.columns:
             result = result[result[col].isin(val.split(","))]
+
     # 國賠
     guo = params.get("national_comp")
     if guo and "是否國賠事件" in result.columns:
         result = result[result["是否國賠事件"] == guo]
+
+    # Countersuit
+    counter = params.get("countersuit")
+    if counter and "是否反訴" in result.columns:
+        result = result[result["是否反訴"] == counter]
+
+    # Appeal
+    appeal = params.get("appeal")
+    if appeal and appeal in ["可上訴", "不可上訴"]:
+        if appeal == "可上訴" and "c0_得上訴" in result.columns:
+            result = result[result["c0_得上訴"].str.strip() != ""]
+        elif appeal == "不可上訴" and "c0_不得上訴" in result.columns:
+            result = result[result["c0_不得上訴"].str.strip() != ""]
+
     return result
 
 
@@ -513,6 +559,17 @@ def civil_filter_options(df):
         if y and m:
             ym_set.add(f"{y.zfill(3)}/{m.zfill(2)}")
 
+    # Build appeals options
+    appeals = {}
+    if "c0_得上訴" in df.columns:
+        has_appeal = df[df["c0_得上訴"].str.strip() != ""].shape[0]
+        if has_appeal > 0:
+            appeals["可上訴"] = has_appeal
+    if "c0_不得上訴" in df.columns:
+        no_appeal = df[df["c0_不得上訴"].str.strip() != ""].shape[0]
+        if no_appeal > 0:
+            appeals["不可上訴"] = no_appeal
+
     return {
         "courts": count_col("法院別") or count_col("c0_法院別"),
         "endings": count_col("終結情形大分類"),
@@ -521,15 +578,35 @@ def civil_filter_options(df):
         "amounts": count_col("訴訟標的金額級距"),
         "ym": sorted(ym_set),
         "nationalComp": count_col("是否國賠事件"),
-        "countersuit": count_col("是否反訴"),
+        "countersuits": count_col("是否反訴"),
+        "appeals": [{"val": k, "count": v} for k, v in appeals.items()],
     }
 
 
 def civil_stats(df):
     jid_col = "裁判書ID" if "裁判書ID" in df.columns else "c0_裁判書ID"
+
+    # Calculate average amount
+    avg_amount = 0
+    if "c0_訴訟標的金額" in df.columns:
+        amounts = df["c0_訴訟標的金額"].apply(parse_int_loose)
+        valid_amounts = amounts.dropna()
+        if len(valid_amounts) > 0:
+            avg_amount = round(valid_amounts.mean(), 0)
+
+    # Calculate lawyer rate
+    lawyer_rate = 0
+    if "律師代理情形" in df.columns:
+        with_lawyer = df[df["律師代理情形"].str.strip() != ""].shape[0]
+        total = len(df)
+        if total > 0:
+            lawyer_rate = round((with_lawyer / total) * 100, 2)
+
     return {
         "judgments": int(df[jid_col].nunique()),
         "totalRows": len(df),
+        "avgAmount": int(avg_amount),
+        "lawyerRate": lawyer_rate,
     }
 
 
@@ -544,22 +621,58 @@ def civil_charts(df):
     cause_data = [{"name": k, "count": int(v)} for k, v in cause_counts.items() if clean(k)]
 
     # 3. Lawyer representation × ending heatmap
+    lawyer_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
     if "律師代理情形" in df.columns:
-        heatmap = _build_heatmap(df, "終結情形大分類", "律師代理情形")
-    else:
-        heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+        lawyer_heatmap = _build_heatmap(df, "終結情形大分類", "律師代理情形")
 
     # 4. Amount distribution × ending
+    amount_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
     if "訴訟標的金額級距" in df.columns:
         amount_heatmap = _build_heatmap(df, "終結情形大分類", "訴訟標的金額級距")
-    else:
-        amount_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+
+    # 5. Cause × Ending stacked bar
+    cause_ending_stack = {"data": [], "segments": []}
+    if "案由大分類" in df.columns and "終結情形大分類" in df.columns:
+        cause_ending_stack = _build_stacked_bar(df, "案由大分類", "終結情形大分類", top_n=8)
+
+    # 6. Amount box-whisker plot
+    amount_box = []
+    if "c0_訴訟標的金額" in df.columns and "案由大分類" in df.columns:
+        df_valid = df[(df["案由大分類"].str.strip() != "") & (df["c0_訴訟標的金額"].str.strip() != "")]
+        if not df_valid.empty:
+            top_causes = [c for c, _ in Counter(df_valid["案由大分類"]).most_common(8)]
+            for cause in top_causes:
+                sub = df_valid[df_valid["案由大分類"] == cause]
+                amounts = sub["c0_訴訟標的金額"].apply(parse_int_loose)
+                valid_amounts = sorted(amounts.dropna().tolist())
+                if valid_amounts:
+                    bs = box_stats(valid_amounts)
+                    if bs:
+                        amount_box.append({
+                            "cause": cause, "n": len(valid_amounts),
+                            **{k: round(v, 0) if isinstance(v, float) else v for k, v in bs.items()},
+                        })
+
+    # 7. Court × Ending heatmap
+    court_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+    court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
+    if court_col in df.columns and "終結情形大分類" in df.columns:
+        court_heatmap = _build_heatmap(df, "終結情形大分類", court_col)
+
+    # 8. Lawyer × Ending stacked bar
+    lawyer_ending_stack = {"data": [], "segments": []}
+    if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
+        lawyer_ending_stack = _build_stacked_bar(df, "律師代理情形", "終結情形大分類")
 
     return {
         "endingDist": ending_data,
         "causeDist": cause_data,
-        "lawyerHeatmap": heatmap,
+        "lawyerHeatmap": lawyer_heatmap,
         "amountHeatmap": amount_heatmap,
+        "causeEndingStack": cause_ending_stack,
+        "amountBox": amount_box,
+        "courtHeatmap": court_heatmap,
+        "lawyerEndingStack": lawyer_ending_stack,
     }
 
 
@@ -575,9 +688,16 @@ def apply_nonlitig_filters(df, params):
         val = params.get(param_key)
         if val and col in result.columns:
             result = result[result[col].isin(val.split(","))]
+
     debt = params.get("is_debt")
     if debt and "是否消債事件" in result.columns:
         result = result[result["是否消債事件"] == debt]
+
+    # Applicant filter
+    applicant = params.get("applicant")
+    if applicant and "c0_聲請人別" in result.columns:
+        result = result[result["c0_聲請人別"].isin(applicant.split(","))]
+
     return result
 
 
@@ -602,18 +722,30 @@ def nonlitig_filter_options(df):
         "causes": count_col("案由大分類"),
         "ym": sorted(ym_set),
         "isDebt": count_col("是否消債事件"),
+        "applicants": count_col("c0_聲請人別"),
     }
 
 
 def nonlitig_stats(df):
     jid_col = "裁判書ID" if "裁判書ID" in df.columns else "c0_裁判書ID"
+
+    # Calculate debt rate
+    debt_rate = 0
+    if "是否消債事件" in df.columns:
+        debt_cases = df[df["是否消債事件"] == "是"].shape[0]
+        total = len(df)
+        if total > 0:
+            debt_rate = round((debt_cases / total) * 100, 2)
+
     return {
         "judgments": int(df[jid_col].nunique()),
         "totalRows": len(df),
+        "debtRate": debt_rate,
     }
 
 
 def nonlitig_charts(df):
+    """Build chart data for civil non-litigation."""
     ending_counts = df["終結情形大分類"].value_counts().to_dict()
     ending_data = [{"name": k, "count": int(v)} for k, v in ending_counts.items() if clean(k)]
 
@@ -632,11 +764,37 @@ def nonlitig_charts(df):
                 endings = sub["終結情形大分類"].value_counts().to_dict()
                 debt_data.append({"label": label, "count": len(sub), "endings": {k: int(v) for k, v in endings.items()}})
 
+    # Court × Ending heatmap
+    court_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+    court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
+    if court_col in df.columns and "終結情形大分類" in df.columns:
+        court_heatmap = _build_heatmap(df, "終結情形大分類", court_col)
+
+    # Cause × Ending stacked bar
+    cause_ending_stack = {"data": [], "segments": []}
+    if "案由大分類" in df.columns and "終結情形大分類" in df.columns:
+        cause_ending_stack = _build_stacked_bar(df, "案由大分類", "終結情形大分類", top_n=8)
+
+    # Debt × Ending heatmap
+    debt_ending_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+    if "是否消債事件" in df.columns and "終結情形大分類" in df.columns:
+        debt_ending_heatmap = _build_heatmap(df, "終結情形大分類", "是否消債事件")
+
+    # Applicant distribution
+    applicant_dist = []
+    if "c0_聲請人別" in df.columns:
+        applicant_counts = df[df["c0_聲請人別"].str.strip() != ""]["c0_聲請人別"].value_counts()
+        applicant_dist = [{"name": k, "count": int(v)} for k, v in applicant_counts.items()]
+
     return {
         "endingDist": ending_data,
         "causeDist": cause_data,
         "causeEndingHeatmap": heatmap,
         "debtComparison": debt_data,
+        "courtHeatmap": court_heatmap,
+        "causeEndingStack": cause_ending_stack,
+        "debtEndingHeatmap": debt_ending_heatmap,
+        "applicantDist": applicant_dist,
     }
 
 
@@ -653,10 +811,17 @@ def apply_family_filters(df, params):
         val = params.get(param_key)
         if val and col in result.columns:
             result = result[result[col].isin(val.split(","))]
+
     # Divorce initiator
     initiator = params.get("initiator")
     if initiator and "主動離婚者" in result.columns:
         result = result[result["主動離婚者"].isin(initiator.split(","))]
+
+    # Divorce reason
+    reason = params.get("divorce_reason")
+    if reason and "離婚原因" in result.columns:
+        result = result[result["離婚原因"].isin(reason.split(","))]
+
     return result
 
 
@@ -688,13 +853,33 @@ def family_filter_options(df):
 
 def family_stats(df):
     jid_col = "裁判書ID" if "裁判書ID" in df.columns else "c0_裁判書ID"
+
+    # Calculate divorce rate
+    divorce_rate = 0
+    if "案由大分類" in df.columns:
+        divorce_cases = df[df["案由大分類"] == "離婚"].shape[0]
+        total = len(df)
+        if total > 0:
+            divorce_rate = round((divorce_cases / total) * 100, 2)
+
+    # Calculate lawyer rate
+    lawyer_rate = 0
+    if "律師代理情形" in df.columns:
+        with_lawyer = df[df["律師代理情形"].str.strip() != ""].shape[0]
+        total = len(df)
+        if total > 0:
+            lawyer_rate = round((with_lawyer / total) * 100, 2)
+
     return {
         "judgments": int(df[jid_col].nunique()),
         "totalRows": len(df),
+        "divorceRate": divorce_rate,
+        "lawyerRate": lawyer_rate,
     }
 
 
 def family_charts(df):
+    """Build chart data for family litigation."""
     ending_data = [{"name": k, "count": int(v)}
                    for k, v in df["終結情形大分類"].value_counts().items() if clean(k)]
 
@@ -718,12 +903,37 @@ def family_charts(df):
         init_counts = df[df["主動離婚者"].str.strip() != ""]["主動離婚者"].value_counts()
         initiator_data = [{"name": k, "count": int(v)} for k, v in init_counts.items()]
 
+    # Court × Ending heatmap
+    court_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+    court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
+    if court_col in df.columns and "終結情形大分類" in df.columns:
+        court_heatmap = _build_heatmap(df, "終結情形大分類", court_col)
+
+    # Cause × Ending stacked bar
+    cause_ending_stack = {"data": [], "segments": []}
+    if "案由大分類" in df.columns and "終結情形大分類" in df.columns:
+        cause_ending_stack = _build_stacked_bar(df, "案由大分類", "終結情形大分類")
+
+    # Initiator × Divorce Reason heatmap
+    initiator_reason_heatmap = {"xLabels": [], "yLabels": [], "matrix": [], "max": 0}
+    if "主動離婚者" in df.columns and "離婚原因" in df.columns:
+        initiator_reason_heatmap = _build_heatmap(df, "離婚原因", "主動離婚者")
+
+    # Lawyer × Ending stacked bar
+    lawyer_ending_stack = {"data": [], "segments": []}
+    if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
+        lawyer_ending_stack = _build_stacked_bar(df, "律師代理情形", "終結情形大分類")
+
     return {
         "endingDist": ending_data,
         "causeDist": cause_data,
         "lawyerHeatmap": heatmap,
         "divorceReasons": divorce_data,
         "initiators": initiator_data,
+        "courtHeatmap": court_heatmap,
+        "causeEndingStack": cause_ending_stack,
+        "divorceInitiatorHeatmap": initiator_reason_heatmap,
+        "lawyerEndingStack": lawyer_ending_stack,
     }
 
 
@@ -872,8 +1082,12 @@ async def get_data(
     article: Optional[str] = None,
     result: Optional[str] = None,
     national_comp: Optional[str] = None,
+    countersuit: Optional[str] = None,
+    appeal: Optional[str] = None,
     is_debt: Optional[str] = None,
+    applicant: Optional[str] = None,
     initiator: Optional[str] = None,
+    divorce_reason: Optional[str] = None,
     page: int = Query(0, ge=0),
     page_size: int = Query(10, ge=1, le=100),
 ):
@@ -886,8 +1100,9 @@ async def get_data(
         "ending": ending, "cause": cause, "lawyer": lawyer, "amount": amount,
         "cls": cls, "defense": defense, "procedure": procedure,
         "probation": probation, "recidivist": recidivist, "article": article,
-        "result": result, "national_comp": national_comp, "is_debt": is_debt,
-        "initiator": initiator,
+        "result": result, "national_comp": national_comp, "countersuit": countersuit,
+        "appeal": appeal, "is_debt": is_debt, "applicant": applicant,
+        "initiator": initiator, "divorce_reason": divorce_reason,
     }
     # Remove None values
     params = {k: v for k, v in params.items() if v is not None}
