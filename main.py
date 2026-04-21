@@ -1,6 +1,6 @@
 """
-裁判書量化實證研究 — FastAPI 後端 V2
-完整篩選（含交集/聯集）、統計、圖表
+裁判書量化實證研究 — FastAPI 後端 V3
+完整篩選（含交集/聯集）、統計、圖表、地圖數據、判決詳情
 """
 import os, math, re, json
 from pathlib import Path
@@ -11,10 +11,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# ════════════════════════════════════════════════════════════
-#  App Setup
-# ════════════════════════════════════════════════════════════
-app = FastAPI(title="裁判書量化實證研究 API", version="2.0.0")
+app = FastAPI(title="裁判書量化實證研究 API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ════════════════════════════════════════════════════════════
@@ -70,11 +67,14 @@ CRIME_FLAGS = [
 ]
 AG_MIT_CATS = ["無加重無減輕", "僅有加重法條", "僅有減輕法條", "有加重有減輕"]
 
-# 案由 keyword extraction
-CIVIL_ACTIONS = ["侵權行為", "損害賠償", "代位請求", "債務人異議", "拆屋還地", "清償", "給付", "返還", "確認", "分割", "撤銷", "除權", "遷讓", "履行"]
-CIVIL_SUBJECTS = ["簽帳卡", "信用卡", "借款", "債務", "消費款", "票款", "電信費", "不當得利", "房屋", "管理費", "貨款", "遺產", "工程款", "土地", "租金", "保險", "本票", "股票"]
-NONLIT_ACTIONS = ["支付命令", "本票裁定", "公示催告", "停止執行", "確定訴訟費用額", "拍賣", "訴訟救助", "更生事件", "聲請免責", "聲請更生", "聲請復權", "清算事件", "聲明異議", "交付", "發還", "返還", "選任", "限期起訴", "除權判決", "給付"]
-NONLIT_SUBJECTS = ["抵押物", "擔保金", "提存物", "光碟", "本票", "送達", "執行", "費用"]
+# Expanded civil keyword lists
+CIVIL_ACTIONS = ["侵權行為", "損害賠償", "國家賠償", "代位請求", "債務人異議", "分配表異議",
+    "拆屋還地", "塗銷", "清償", "給付", "返還", "確認", "分割", "撤銷", "除權",
+    "遷讓", "履行", "拍賣", "再審"]
+CIVIL_SUBJECTS = ["簽帳卡", "信用卡", "現金卡", "借款", "消費借貸", "債務", "消費款",
+    "票款", "電信費", "不當得利", "房屋", "管理費", "貨款", "遺產", "工程款",
+    "土地", "租金", "保險", "本票", "股票", "買賣價金", "薪資", "資遣費",
+    "抵押", "共有物", "契約"]
 
 # ════════════════════════════════════════════════════════════
 #  Data Loading
@@ -83,10 +83,10 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent / "Data")))
 CASE_TYPES = {
     "criminal_litigation": {"label": "刑事訴訟", "category": "criminal", "file_pattern": "刑事訴訟"},
     "civil_litigation": {"label": "民事訴訟", "category": "civil", "file_pattern": "民事訴訟"},
-    "civil_nonlitig": {"label": "民事非訟", "category": "civil", "file_pattern": "民事非訟"},
     "family_litigation": {"label": "家事訴訟", "category": "family", "file_pattern": "家事訴訟"},
 }
 DATA: dict[str, pd.DataFrame] = {}
+CACHE: dict[str, dict] = {}  # precomputed default results
 
 def _find_csv(pattern):
     for f in sorted(DATA_DIR.glob("*.csv")):
@@ -102,12 +102,9 @@ def _extract_keyword(text, keywords):
     return "其他"
 
 def _preprocess(key, df):
-    """Preprocess data after loading."""
     if key == "criminal_litigation":
-        # Merge 多人一罪 → 多人多罪
         if "案件分類" in df.columns:
             df.loc[df["案件分類"] == "多人一罪", "案件分類"] = "多人多罪"
-        # Compute ag_mit category
         agg_col = "c111_量刑加重" if "c111_量刑加重" in df.columns else None
         mit_col = "c112_量刑減輕" if "c112_量刑減輕" in df.columns else None
         if agg_col and mit_col:
@@ -118,21 +115,13 @@ def _preprocess(key, df):
             cat[~ha & hm] = "僅有減輕法條"
             cat[ha & hm] = "有加重有減輕"
             df["_ag_mit"] = cat
-        # Map probation and recidivist
         prb_col = "c1_是否宣告緩刑" if "c1_是否宣告緩刑" in df.columns else None
         if prb_col:
             df["_probation"] = df[prb_col].map({"1": "有緩刑", "0": "無緩刑"}).fillna("")
-        rec_col = "c1_是否為累犯" if "c1_是否為累犯" in df.columns else None
-        if rec_col:
-            df["_recidivist"] = df[rec_col].map({"1": "累犯", "0": "非累犯"}).fillna("")
     elif key == "civil_litigation":
         if "c0_案由" in df.columns:
             df["_action"] = df["c0_案由"].apply(lambda x: _extract_keyword(x, CIVIL_ACTIONS))
             df["_subject"] = df["c0_案由"].apply(lambda x: _extract_keyword(x, CIVIL_SUBJECTS))
-    elif key == "civil_nonlitig":
-        if "c0_案由" in df.columns:
-            df["_action"] = df["c0_案由"].apply(lambda x: _extract_keyword(x, NONLIT_ACTIONS))
-            df["_subject"] = df["c0_案由"].apply(lambda x: _extract_keyword(x, NONLIT_SUBJECTS))
     return df
 
 def _load_all():
@@ -147,6 +136,11 @@ def _load_all():
             print(f"  → {len(df)} rows, {len(df.columns)} cols")
         else:
             print(f"Warning: no CSV found for {key}")
+    # Precompute defaults
+    for key in DATA:
+        print(f"Precomputing defaults for {key}...")
+        CACHE[key] = _compute_response(key, DATA[key])
+    print("All precomputation done.")
 
 @app.on_event("startup")
 async def startup():
@@ -161,31 +155,16 @@ def clean(v):
 def split_pipe(v):
     return [x.strip() for x in str(v).split("|") if x.strip()]
 
-def parse_int_loose(v):
-    pure = re.sub(r"[^\d-]", "", str(v))
-    if not pure:
-        return None
-    try:
-        return int(pure)
-    except ValueError:
-        return None
-
 def parse_months(s):
     v = re.sub(r"\D", "", str(s))
-    if not v:
-        return None
-    if len(v) >= 4:
-        y, m = int(v[:-2]) or 0, int(v[-2:]) or 0
-    elif len(v) == 3:
-        y, m = int(v[0]) or 0, int(v[1:]) or 0
-    else:
-        m = int(v) or 0
-        y = 0
+    if not v: return None
+    if len(v) >= 4: y, m = int(v[:-2]) or 0, int(v[-2:]) or 0
+    elif len(v) == 3: y, m = int(v[0]) or 0, int(v[1:]) or 0
+    else: m = int(v) or 0; y = 0
     return y * 12 + m
 
 def count_col(df, col):
-    if col not in df.columns:
-        return []
+    if col not in df.columns: return []
     return [{"val": k, "count": int(v)} for k, v in df[col].value_counts().items() if clean(k)]
 
 def get_ym(df):
@@ -209,8 +188,7 @@ def flag_opts(df, flags):
     return result
 
 def quantile(sorted_arr, q):
-    if not sorted_arr:
-        return 0
+    if not sorted_arr: return 0
     p = (len(sorted_arr) - 1) * q
     b = int(p)
     if b + 1 < len(sorted_arr):
@@ -219,21 +197,15 @@ def quantile(sorted_arr, q):
 
 def box_stats(values):
     s = sorted(values)
-    if not s:
-        return None
-    q1 = quantile(s, 0.25)
-    median = quantile(s, 0.5)
-    q3 = quantile(s, 0.75)
+    if not s: return None
+    q1, median, q3 = quantile(s, 0.25), quantile(s, 0.5), quantile(s, 0.75)
     iqr = q3 - q1
     lf, uf = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     inliers = [v for v in s if lf <= v <= uf]
-    return {
-        "q1": q1, "median": median, "q3": q3, "iqr": iqr,
-        "whiskerLow": inliers[0] if inliers else s[0],
-        "whiskerHigh": inliers[-1] if inliers else s[-1],
-        "outliers": [v for v in s if v < lf or v > uf],
-        "min": s[0], "max": s[-1],
-    }
+    return {"q1": q1, "median": median, "q3": q3, "iqr": iqr,
+            "whiskerLow": inliers[0] if inliers else s[0],
+            "whiskerHigh": inliers[-1] if inliers else s[-1],
+            "outliers": [v for v in s if v < lf or v > uf], "min": s[0], "max": s[-1]}
 
 # ════════════════════════════════════════════════════════════
 #  Shared Chart Builders
@@ -249,20 +221,16 @@ def _build_heatmap(df, x_col, y_col, x_limit=8, y_limit=8):
     ct = pd.crosstab(ys, xs)
     x_totals = ct.sum(axis=0).sort_values(ascending=False)
     y_totals = ct.sum(axis=1).sort_values(ascending=False)
-    # Put 其他 last
     x_labels = [x for x in x_totals.index if x != "其他"]
-    if "其他" in x_totals.index:
-        x_labels.append("其他")
+    if "其他" in x_totals.index: x_labels.append("其他")
     y_labels = [y for y in y_totals.index if y != "其他"]
-    if "其他" in y_totals.index:
-        y_labels.append("其他")
+    if "其他" in y_totals.index: y_labels.append("其他")
     matrix, max_val = [], 0
     for y in y_labels:
         row = []
         for x in x_labels:
             v = int(ct.at[y, x]) if y in ct.index and x in ct.columns else 0
-            if v > max_val:
-                max_val = v
+            if v > max_val: max_val = v
             row.append(v)
         matrix.append(row)
     return {"xLabels": x_labels, "yLabels": y_labels, "matrix": matrix, "max": max_val}
@@ -283,65 +251,104 @@ def _build_stacked_bar(df, group_col, segment_col, top_n=8):
         for i, s in enumerate(segments):
             if i < len(segments) - 1:
                 t = round((cats.get(s, 0) / total) * 1000) if total else 0
-                row[s] = t
-                acc += t
+                row[s] = t; acc += t
             else:
                 row[s] = 1000 - acc
         data.append(row)
     return {"data": data, "segments": segments}
 
+def _build_dual_axis_bar(df, group_col, segment_col, top_n=8):
+    """Bar chart with actual counts + proportion line on secondary axis."""
+    filtered = df[(df[group_col].str.strip() != "") & (df[segment_col].str.strip() != "")]
+    if filtered.empty:
+        return {"groups": [], "segments": [], "data": []}
+    segments = [s for s, _ in Counter(filtered[segment_col]).most_common()]
+    top_groups = [g for g, _ in Counter(filtered[group_col]).most_common(top_n)]
+    grand_total = len(filtered)
+    data = []
+    for group in top_groups:
+        sub = filtered[filtered[group_col] == group]
+        total = len(sub)
+        cats = sub[segment_col].value_counts().to_dict()
+        row = {"name": group, "total": total, "pct": round(float(total / grand_total) * 100, 1) if grand_total else 0}
+        for s in segments:
+            row[s] = cats.get(s, 0)
+        data.append(row)
+    return {"groups": top_groups, "segments": segments, "data": data, "grandTotal": grand_total}
+
+# ════════════════════════════════════════════════════════════
+#  Court Map Data Builder
+# ════════════════════════════════════════════════════════════
+def _build_court_map(df, court_col, category_col=None, lawyer_col=None, ending_col=None, top_cats=5):
+    """Build per-court statistics for map visualization."""
+    if court_col not in df.columns:
+        return []
+    courts = df[court_col].value_counts()
+    total_all = len(df)
+    result = []
+    for court, count in courts.items():
+        if not clean(court):
+            continue
+        info = {"court": court, "count": int(count), "pct": round(float(count / total_all) * 100, 1) if total_all else 0}
+        sub = df[df[court_col] == court]
+        # Top categories
+        if category_col and category_col in sub.columns:
+            cat_counts = sub[category_col].value_counts().head(top_cats)
+            info["topCats"] = [{"name": k, "count": int(v), "pct": round(float(v / count) * 100, 1)} for k, v in cat_counts.items() if clean(k)]
+        # Lawyer rate
+        if lawyer_col and lawyer_col in sub.columns:
+            with_lawyer = int((sub[lawyer_col] != "雙方無律師").sum())
+            info["lawyerRate"] = round(float(with_lawyer / count) * 100, 1) if count else 0
+            # Win rate with vs without lawyer
+            if ending_col and ending_col in sub.columns:
+                has_l = sub[sub[lawyer_col] != "雙方無律師"]
+                no_l = sub[sub[lawyer_col] == "雙方無律師"]
+                info["withLawyerWinRate"] = round(float((has_l[ending_col] == "勝訴").sum() / len(has_l)) * 100, 1) if len(has_l) else 0
+                info["noLawyerWinRate"] = round(float((no_l[ending_col] == "勝訴").sum() / len(no_l)) * 100, 1) if len(no_l) else 0
+        result.append(info)
+    return result
+
 # ════════════════════════════════════════════════════════════
 #  Common Filter Application
 # ════════════════════════════════════════════════════════════
 def _apply_ym_filter(df, ym_min, ym_max):
-    if not ym_min and not ym_max:
-        return df
+    if not ym_min and not ym_max: return df
     y_col = "終結年" if "終結年" in df.columns else "c0_全案終結日期-年"
     m_col = "終結月" if "終結月" in df.columns else "c0_全案終結日期-月"
-    if y_col not in df.columns or m_col not in df.columns:
-        return df
+    if y_col not in df.columns or m_col not in df.columns: return df
     ym = df[y_col].str.zfill(3) + "/" + df[m_col].str.zfill(2)
     mask = pd.Series(True, index=df.index)
-    if ym_min:
-        mask &= ym >= ym_min
-    if ym_max:
-        mask &= ym <= ym_max
+    if ym_min: mask &= ym >= ym_min
+    if ym_max: mask &= ym <= ym_max
     return df[mask]
 
 def _apply_csv_filter(df, col, values, mode="or"):
-    if not values or col not in df.columns:
-        return df
+    if not values or col not in df.columns: return df
     vals = values.split(",") if isinstance(values, str) else values
     return df[df[col].isin(vals)]
 
 def _apply_flag_filter(df, flags, selected_labels, mode="or"):
-    if not selected_labels:
-        return df
+    if not selected_labels: return df
     labels = selected_labels.split(",") if isinstance(selected_labels, str) else selected_labels
     label_to_col = {label: col for col, label in flags}
     cols = [(label_to_col[l], l) for l in labels if l in label_to_col]
-    if not cols:
-        return df
+    if not cols: return df
     if mode == "and":
         mask = pd.Series(True, index=df.index)
         for col, _ in cols:
-            if col in df.columns:
-                mask &= df[col] == "1"
+            if col in df.columns: mask &= df[col] == "1"
     else:
         mask = pd.Series(False, index=df.index)
         for col, _ in cols:
-            if col in df.columns:
-                mask |= df[col] == "1"
+            if col in df.columns: mask |= df[col] == "1"
     return df[mask]
 
 def _apply_pipe_filter(df, col, selected, mode="or"):
-    if not selected or col not in df.columns:
-        return df
+    if not selected or col not in df.columns: return df
     vals = selected.split(",") if isinstance(selected, str) else selected
     if mode == "and":
         mask = pd.Series(True, index=df.index)
-        for v in vals:
-            mask &= df[col].str.contains(re.escape(v.strip()), na=False)
+        for v in vals: mask &= df[col].str.contains(re.escape(v.strip()), na=False)
     else:
         pattern = "|".join(re.escape(v.strip()) for v in vals)
         mask = df[col].str.contains(pattern, na=False)
@@ -359,12 +366,10 @@ def criminal_filter_options(df):
     agg_vals, mit_vals = {}, {}
     if agg_col:
         for v in df[agg_col]:
-            for t in split_pipe(v):
-                agg_vals[t] = agg_vals.get(t, 0) + 1
+            for t in split_pipe(v): agg_vals[t] = agg_vals.get(t, 0) + 1
     if mit_col:
         for v in df[mit_col]:
-            for t in split_pipe(v):
-                mit_vals[t] = mit_vals.get(t, 0) + 1
+            for t in split_pipe(v): mit_vals[t] = mit_vals.get(t, 0) + 1
     result_col = "c11_被告罪名裁判結果" if "c11_被告罪名裁判結果" in df.columns else "罪名裁判結果"
     return {
         "classes": count_col(df, "案件分類"),
@@ -373,7 +378,6 @@ def criminal_filter_options(df):
         "defs": count_col(df, "c1_辯護及代理"),
         "procs": count_col(df, "c1_裁判程序"),
         "probs": count_col(df, "_probation") if "_probation" in df.columns else [],
-        "recid": count_col(df, "_recidivist") if "_recidivist" in df.columns else [],
         "articles": count_col(df, "定罪法條"),
         "results": count_col(df, result_col),
         "aggr": [{"val": k, "count": v} for k, v in sorted(agg_vals.items(), key=lambda x: -x[1])],
@@ -396,24 +400,19 @@ def apply_criminal_filters(df, params, logic):
     result = _apply_csv_filter(result, "c1_辯護及代理", params.get("defense"))
     result = _apply_csv_filter(result, "c1_裁判程序", params.get("procedure"))
     result = _apply_csv_filter(result, "_probation", params.get("probation"))
-    result = _apply_csv_filter(result, "_recidivist", params.get("recidivist"))
     result = _apply_csv_filter(result, "定罪法條", params.get("article"))
     result_col = "c11_被告罪名裁判結果" if "c11_被告罪名裁判結果" in result.columns else "罪名裁判結果"
     result = _apply_csv_filter(result, result_col, params.get("result"))
-    # Flag filters with logic
     result = _apply_flag_filter(result, SECURITY_FLAGS, params.get("security"), _get_logic(logic, "security"))
     result = _apply_flag_filter(result, COMPENSATION_FLAGS, params.get("compensation"), _get_logic(logic, "compensation"))
     result = _apply_flag_filter(result, CONFISCATION_FLAGS, params.get("confiscation"), _get_logic(logic, "confiscation"))
     result = _apply_flag_filter(result, PROBCOND_FLAGS, params.get("probcond"), _get_logic(logic, "probcond"))
     result = _apply_flag_filter(result, DV_FLAGS, params.get("dv"), _get_logic(logic, "dv"))
     result = _apply_flag_filter(result, CRIME_FLAGS, params.get("crime_flags"), _get_logic(logic, "crime_flags"))
-    # Pipe filters
     agg_col = "c111_量刑加重" if "c111_量刑加重" in result.columns else None
     mit_col = "c112_量刑減輕" if "c112_量刑減輕" in result.columns else None
-    if agg_col:
-        result = _apply_pipe_filter(result, agg_col, params.get("aggravation"), _get_logic(logic, "aggravation"))
-    if mit_col:
-        result = _apply_pipe_filter(result, mit_col, params.get("mitigation"), _get_logic(logic, "mitigation"))
+    if agg_col: result = _apply_pipe_filter(result, agg_col, params.get("aggravation"), _get_logic(logic, "aggravation"))
+    if mit_col: result = _apply_pipe_filter(result, mit_col, params.get("mitigation"), _get_logic(logic, "mitigation"))
     return result
 
 def criminal_stats(df):
@@ -425,15 +424,29 @@ def criminal_stats(df):
         "uniqueLawCount": int(df["定罪法條"].nunique()) if "定罪法條" in df.columns else 0,
     }
 
-def criminal_charts(df):
+def criminal_charts(df, params=None):
     charts = {}
-    # 1. Case heatmap
-    if "案件分類" in df.columns and "c0_全案終結情形" in df.columns:
-        charts["caseHeatmap"] = _build_heatmap(df, "c0_全案終結情形", "案件分類")
-    # 2. Law stacked bar (ag/mit)
+    # Auto-select heatmap axes based on filters
+    has_ending_filter = bool(params and params.get("ending"))
+    has_court_filter = bool(params and params.get("court"))
+    has_class_filter = bool(params and params.get("cls"))
+    # Determine best heatmap combination
+    if has_ending_filter and not has_court_filter:
+        hm_x, hm_y = "c0_法院別", "案件分類"
+        hm_title = "案件分類 × 法院別"
+    elif has_court_filter and not has_ending_filter:
+        hm_x, hm_y = "c0_全案終結情形", "案件分類"
+        hm_title = "案件分類 × 終結情形"
+    else:
+        hm_x, hm_y = "c0_全案終結情形", "案件分類"
+        hm_title = "案件分類 × 終結情形"
+    if hm_x in df.columns and hm_y in df.columns:
+        charts["caseHeatmap"] = {**_build_heatmap(df, hm_x, hm_y), "heatmapTitle": hm_title}
+
+    # Law stacked bar
     if "定罪法條" in df.columns and "_ag_mit" in df.columns:
         charts["lawStack"] = _build_stacked_bar(df, "定罪法條", "_ag_mit", top_n=8)
-    # 3. Violin plot data (law → imprisonment values)
+    # Violin
     violin = []
     if "定罪法條" in df.columns and "c11_宣告有期徒刑" in df.columns:
         top_laws = [l for l, _ in Counter(df[df["定罪法條"].str.strip() != ""]["定罪法條"]).most_common(8)]
@@ -444,7 +457,7 @@ def criminal_charts(df):
                 s = sorted(vals)
                 violin.append({"name": law, "values": s, "mean": sum(s)/len(s), "median": quantile(s, 0.5), "n": len(s)})
     charts["violin"] = violin
-    # 4. Box-whisker
+    # Box-whisker
     box_data = []
     if "定罪法條" in df.columns and "c11_宣告有期徒刑" in df.columns:
         top_laws = [l for l, _ in Counter(df[df["定罪法條"].str.strip() != ""]["定罪法條"]).most_common(8)]
@@ -454,12 +467,10 @@ def criminal_charts(df):
             if vals:
                 bs = box_stats(vals)
                 if bs:
-                    # Determine dominant ag_mit
                     dominant = "無加重無減輕"
                     if "_ag_mit" in sub.columns:
                         am_counts = sub["_ag_mit"].value_counts()
-                        if len(am_counts) > 0:
-                            dominant = am_counts.index[0]
+                        if len(am_counts) > 0: dominant = am_counts.index[0]
                     box_data.append({"law": law, "n": len(vals), "dominant": dominant, **bs})
     charts["boxWhisker"] = box_data
     return charts
@@ -509,77 +520,30 @@ def civil_stats(df):
     if "律師代理情形" in df.columns and total > 0:
         with_lawyer = (df["律師代理情形"] != "雙方無律師").sum()
         lawyer_rate = round(float(with_lawyer / total) * 100, 1)
-    return {
-        "judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0,
-        "lawyerRate": lawyer_rate,
-    }
+    return {"judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0, "lawyerRate": lawyer_rate}
 
 def civil_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    # 1. Court × Subject heatmap
-    if "_subject" in df.columns:
-        charts["courtSubjectHeatmap"] = _build_heatmap(df, "_subject", court_col)
-    # 2. Action × Subject cross-analysis
-    if "_action" in df.columns and "_subject" in df.columns:
-        charts["actionSubjectHeatmap"] = _build_heatmap(df, "_subject", "_action")
-    # 3. Amount × Lawyer cross-analysis
+    # Court map data
+    charts["courtMap"] = _build_court_map(df, court_col, "_subject", "律師代理情形", "終結情形大分類")
+    # Amount × Lawyer heatmap (sorted by amount)
     if "訴訟標的金額級距" in df.columns and "律師代理情形" in df.columns:
-        charts["amountLawyerHeatmap"] = _build_heatmap(df, "律師代理情形", "訴訟標的金額級距", x_limit=6, y_limit=8)
-    # 4. Lawyer × Ending stacked bar
+        amt_order = ["<10萬", "10-50萬", "50-100萬", "100-500萬", "500-1000萬", ">1000萬"]
+        hm = _build_heatmap(df, "律師代理情形", "訴訟標的金額級距", x_limit=6, y_limit=8)
+        # Reorder y-axis by amount order
+        if hm["yLabels"]:
+            ordered_y = [a for a in amt_order if a in hm["yLabels"]]
+            remaining = [y for y in hm["yLabels"] if y not in ordered_y]
+            new_y = ordered_y + remaining
+            old_y_idx = {y: i for i, y in enumerate(hm["yLabels"])}
+            new_matrix = [hm["matrix"][old_y_idx[y]] for y in new_y if y in old_y_idx]
+            hm["yLabels"] = [y for y in new_y if y in old_y_idx]
+            hm["matrix"] = new_matrix
+        charts["amountLawyerHeatmap"] = hm
+    # Lawyer × Ending dual-axis bar
     if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
-        charts["lawyerEndingStack"] = _build_stacked_bar(df, "律師代理情形", "終結情形大分類")
-    return charts
-
-# ════════════════════════════════════════════════════════════
-#  Civil Non-litigation
-# ════════════════════════════════════════════════════════════
-def nonlitig_filter_options(df):
-    return {
-        "courts": count_col(df, "法院別") or count_col(df, "c0_法院別"),
-        "endings": count_col(df, "終結情形大分類"),
-        "actions": count_col(df, "_action") if "_action" in df.columns else [],
-        "subjects": count_col(df, "_subject") if "_subject" in df.columns else [],
-        "isDebt": count_col(df, "是否消債事件"),
-        "debtReasons": count_col(df, "c1_消債事件駁回原因"),
-        "causes": count_col(df, "案由大分類"),
-        "ym": get_ym(df),
-    }
-
-def apply_nonlitig_filters(df, params, logic):
-    result = df
-    court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    result = _apply_csv_filter(result, court_col, params.get("court"))
-    result = _apply_csv_filter(result, "終結情形大分類", params.get("ending"))
-    result = _apply_csv_filter(result, "_action", params.get("action"))
-    result = _apply_csv_filter(result, "_subject", params.get("subject"))
-    if params.get("is_debt"):
-        result = _apply_csv_filter(result, "是否消債事件", params.get("is_debt"))
-    result = _apply_csv_filter(result, "c1_消債事件駁回原因", params.get("debt_reason"))
-    result = _apply_ym_filter(result, params.get("ym_min"), params.get("ym_max"))
-    return result
-
-def nonlitig_stats(df):
-    jid_col = "裁判書ID" if "裁判書ID" in df.columns else "c0_裁判書ID"
-    return {
-        "judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0,
-    }
-
-def nonlitig_charts(df):
-    charts = {}
-    court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    # 1. Court × Action stacked bar
-    if "_action" in df.columns:
-        charts["courtActionStack"] = _build_stacked_bar(df, court_col, "_action", top_n=10)
-    # 2. Action × Subject heatmap
-    if "_action" in df.columns and "_subject" in df.columns:
-        charts["actionSubjectHeatmap"] = _build_heatmap(df, "_subject", "_action")
-    # 3. Court × Ending heatmap
-    if "終結情形大分類" in df.columns:
-        charts["courtEndingHeatmap"] = _build_heatmap(df, "終結情形大分類", court_col)
-    # 4. Cause × Ending stacked bar
-    if "案由大分類" in df.columns and "終結情形大分類" in df.columns:
-        charts["causeEndingStack"] = _build_stacked_bar(df, "案由大分類", "終結情形大分類", top_n=8)
+        charts["lawyerEndingBar"] = _build_dual_axis_bar(df, "律師代理情形", "終結情形大分類")
     return charts
 
 # ════════════════════════════════════════════════════════════
@@ -621,22 +585,17 @@ def family_stats(df):
     if "案由大分類" in df.columns and total > 0:
         divorce_cases = (df["案由大分類"] == "離婚").sum()
         divorce_rate = round(float(divorce_cases / total) * 100, 1)
-    return {
-        "judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0,
-        "lawyerRate": lawyer_rate,
-        "divorceRate": divorce_rate,
-    }
+    return {"judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0, "lawyerRate": lawyer_rate, "divorceRate": divorce_rate}
 
 def family_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    # 1. Court × Cause heatmap
-    if "案由大分類" in df.columns:
-        charts["courtCauseHeatmap"] = _build_heatmap(df, "案由大分類", court_col)
-    # 2. Divorce analysis (for 離婚 cases only)
+    # Divorce court map
     divorce_sub = df[df["案由大分類"] == "離婚"] if "案由大分類" in df.columns else pd.DataFrame()
     reason_col = "離婚原因" if "離婚原因" in df.columns else "c0_離婚原因"
     init_col = "主動離婚者" if "主動離婚者" in df.columns else "c0_主動離婚者"
+    charts["divorceCourtMap"] = _build_court_map(divorce_sub, court_col, reason_col, "律師代理情形", "終結情形大分類") if not divorce_sub.empty else []
+    # Divorce analysis
     divorce_analysis = {"reasonDist": [], "initiatorDist": [], "endingDist": []}
     if not divorce_sub.empty:
         if reason_col in divorce_sub.columns:
@@ -649,20 +608,17 @@ def family_charts(df):
             ec = divorce_sub["終結情形大分類"].value_counts()
             divorce_analysis["endingDist"] = [{"name": k, "count": int(v)} for k, v in ec.items() if clean(k)]
     charts["divorceAnalysis"] = divorce_analysis
-    # 3. Inheritance analysis (for 繼承 cases only)
+    # Inheritance court map
     inherit_sub = df[df["案由大分類"] == "繼承"] if "案由大分類" in df.columns else pd.DataFrame()
-    inherit_analysis = {"endingDist": [], "total": len(inherit_sub)}
-    if not inherit_sub.empty and "終結情形大分類" in inherit_sub.columns:
-        ec = inherit_sub["終結情形大分類"].value_counts()
-        inherit_analysis["endingDist"] = [{"name": k, "count": int(v)} for k, v in ec.items() if clean(k)]
-    charts["inheritAnalysis"] = inherit_analysis
-    # 4. Lawyer × Cause stacked bar
+    charts["inheritCourtMap"] = _build_court_map(inherit_sub, court_col, "案由大分類", "律師代理情形", "終結情形大分類") if not inherit_sub.empty else []
+    charts["inheritTotal"] = len(inherit_sub)
+    # Lawyer × Cause dual-axis bar
     if "律師代理情形" in df.columns and "案由大分類" in df.columns:
-        charts["lawyerCauseStack"] = _build_stacked_bar(df, "律師代理情形", "案由大分類")
+        charts["lawyerCauseBar"] = _build_dual_axis_bar(df, "律師代理情形", "案由大分類")
     return charts
 
 # ════════════════════════════════════════════════════════════
-#  Judgment List (paginated)
+#  Judgment List (paginated, with detail)
 # ════════════════════════════════════════════════════════════
 def get_judgment_list(df, case_type, page=0, page_size=10):
     jid_col = "裁判書ID" if "裁判書ID" in df.columns else "c0_裁判書ID"
@@ -681,12 +637,54 @@ def get_judgment_list(df, case_type, page=0, page_size=10):
         if case_type == "criminal_litigation":
             item["ending"] = clean(first.get("c0_全案終結情形", ""))
             item["cls"] = clean(first.get("案件分類", ""))
-            item["defendants"] = int(rows.iloc[0].get("判決被告人數", 1)) if "判決被告人數" in rows.columns else 1
+            item["defendants"] = int(first.get("判決被告人數", 1)) if "判決被告人數" in rows.columns else 1
+            item["law"] = clean(first.get("定罪法條", ""))
+            result_col = "c11_被告罪名裁判結果" if "c11_被告罪名裁判結果" in rows.columns else "罪名裁判結果"
+            item["result"] = clean(first.get(result_col, ""))
+            item["sentence"] = clean(first.get("c11_宣告有期徒刑", ""))
+            item["probation"] = first.get("c1_是否宣告緩刑", "") == "1"
+            item["defense"] = clean(first.get("c1_辯護及代理", ""))
+            # Flags
+            tags = []
+            for col, label in CRIME_FLAGS:
+                if col in rows.columns and first.get(col, "") == "1": tags.append(label)
+            item["tags"] = tags
         else:
             end_col = "終結情形大分類" if "終結情形大分類" in df.columns else ""
             item["ending"] = clean(first.get(end_col, ""))
+            if "律師代理情形" in df.columns:
+                item["lawyer"] = clean(first.get("律師代理情形", ""))
+            if "訴訟標的金額級距" in df.columns:
+                item["amountTier"] = clean(first.get("訴訟標的金額級距", ""))
+            if "訴訟標的金額" in df.columns:
+                item["amount"] = clean(first.get("訴訟標的金額", ""))
+            if "案由大分類" in df.columns:
+                item["causeCat"] = clean(first.get("案由大分類", ""))
+            if case_type == "family_litigation":
+                init_col = "主動離婚者" if "主動離婚者" in df.columns else "c0_主動離婚者"
+                reason_col = "離婚原因" if "離婚原因" in df.columns else "c0_離婚原因"
+                item["initiator"] = clean(first.get(init_col, ""))
+                item["divorceReason"] = clean(first.get(reason_col, ""))
         items.append(item)
     return {"items": items, "total": total, "totalPages": total_pages}
+
+# ════════════════════════════════════════════════════════════
+#  Unified Compute
+# ════════════════════════════════════════════════════════════
+def _compute_response(case_type, df, params=None, page=0, page_size=10):
+    if case_type == "criminal_litigation":
+        stats = criminal_stats(df)
+        charts = criminal_charts(df, params)
+    elif case_type == "civil_litigation":
+        stats = civil_stats(df)
+        charts = civil_charts(df)
+    elif case_type == "family_litigation":
+        stats = family_stats(df)
+        charts = family_charts(df)
+    else:
+        return {"stats": {}, "charts": {}, "judgments": {"items": [], "total": 0, "totalPages": 1}}
+    judgments = get_judgment_list(df, case_type, page, page_size)
+    return {"stats": stats, "charts": charts, "judgments": judgments, "filteredRows": len(df)}
 
 # ════════════════════════════════════════════════════════════
 #  API Routes
@@ -703,76 +701,40 @@ async def get_options(case_type: str):
     if case_type not in DATA:
         return JSONResponse(status_code=404, content={"error": f"Unknown type: {case_type}"})
     df = DATA[case_type]
-    if case_type == "criminal_litigation":
-        return criminal_filter_options(df)
-    elif case_type == "civil_litigation":
-        return civil_filter_options(df)
-    elif case_type == "civil_nonlitig":
-        return nonlitig_filter_options(df)
-    elif case_type == "family_litigation":
-        return family_filter_options(df)
+    if case_type == "criminal_litigation": return criminal_filter_options(df)
+    elif case_type == "civil_litigation": return civil_filter_options(df)
+    elif case_type == "family_litigation": return family_filter_options(df)
     return {}
 
 @app.get("/api/{case_type}/data")
 async def get_data(
     case_type: str,
-    # Common
-    court: Optional[str] = None,
-    ym_min: Optional[str] = None,
-    ym_max: Optional[str] = None,
-    ending: Optional[str] = None,
-    logic: Optional[str] = None,
-    page: int = Query(0, ge=0),
-    page_size: int = Query(10, ge=1, le=100),
-    # Criminal
-    cls: Optional[str] = None,
-    defense: Optional[str] = None,
-    procedure: Optional[str] = None,
-    probation: Optional[str] = None,
-    recidivist: Optional[str] = None,
-    article: Optional[str] = None,
-    result: Optional[str] = None,
-    security: Optional[str] = None,
-    compensation: Optional[str] = None,
-    confiscation: Optional[str] = None,
-    probcond: Optional[str] = None,
-    dv: Optional[str] = None,
-    crime_flags: Optional[str] = None,
-    aggravation: Optional[str] = None,
-    mitigation: Optional[str] = None,
-    # Civil
-    action: Optional[str] = None,
-    subject: Optional[str] = None,
-    lawsuit_type: Optional[str] = None,
-    amount_tier: Optional[str] = None,
-    lawyer: Optional[str] = None,
-    national_comp: Optional[str] = None,
-    agency_type: Optional[str] = None,
-    comp_type: Optional[str] = None,
-    public_type: Optional[str] = None,
-    election_type: Optional[str] = None,
-    # Nonlitig
-    is_debt: Optional[str] = None,
-    debt_reason: Optional[str] = None,
-    # Family
-    cause: Optional[str] = None,
-    initiator: Optional[str] = None,
-    divorce_reason: Optional[str] = None,
+    court: Optional[str] = None, ym_min: Optional[str] = None, ym_max: Optional[str] = None,
+    ending: Optional[str] = None, logic: Optional[str] = None,
+    page: int = Query(0, ge=0), page_size: int = Query(10, ge=1, le=100),
+    cls: Optional[str] = None, defense: Optional[str] = None, procedure: Optional[str] = None,
+    probation: Optional[str] = None, article: Optional[str] = None, result: Optional[str] = None,
+    security: Optional[str] = None, compensation: Optional[str] = None, confiscation: Optional[str] = None,
+    probcond: Optional[str] = None, dv: Optional[str] = None, crime_flags: Optional[str] = None,
+    aggravation: Optional[str] = None, mitigation: Optional[str] = None,
+    action: Optional[str] = None, subject: Optional[str] = None, lawsuit_type: Optional[str] = None,
+    amount_tier: Optional[str] = None, lawyer: Optional[str] = None, national_comp: Optional[str] = None,
+    agency_type: Optional[str] = None, comp_type: Optional[str] = None,
+    public_type: Optional[str] = None, election_type: Optional[str] = None,
+    cause: Optional[str] = None, initiator: Optional[str] = None, divorce_reason: Optional[str] = None,
 ):
     if case_type not in DATA:
         return JSONResponse(status_code=404, content={"error": f"Unknown type: {case_type}"})
 
     logic_dict = {}
     if logic:
-        try:
-            logic_dict = json.loads(logic)
-        except:
-            pass
+        try: logic_dict = json.loads(logic)
+        except: pass
 
     params = {k: v for k, v in {
         "court": court, "ym_min": ym_min, "ym_max": ym_max, "ending": ending,
         "cls": cls, "defense": defense, "procedure": procedure, "probation": probation,
-        "recidivist": recidivist, "article": article, "result": result,
+        "article": article, "result": result,
         "security": security, "compensation": compensation, "confiscation": confiscation,
         "probcond": probcond, "dv": dv, "crime_flags": crime_flags,
         "aggravation": aggravation, "mitigation": mitigation,
@@ -780,23 +742,29 @@ async def get_data(
         "amount_tier": amount_tier, "lawyer": lawyer, "national_comp": national_comp,
         "agency_type": agency_type, "comp_type": comp_type, "public_type": public_type,
         "election_type": election_type,
-        "is_debt": is_debt, "debt_reason": debt_reason,
         "cause": cause, "initiator": initiator, "divorce_reason": divorce_reason,
     }.items() if v is not None}
+
+    # If no filters, return cached default (but still paginate)
+    has_filters = any(v for k, v in params.items() if k not in ("ym_min", "ym_max") and v)
+    has_ym = bool(params.get("ym_min") or params.get("ym_max"))
+
+    if not has_filters and not has_ym and case_type in CACHE:
+        cached = CACHE[case_type]
+        # Re-paginate
+        df = DATA[case_type]
+        judgments = get_judgment_list(df, case_type, page, page_size)
+        return {**cached, "judgments": judgments}
 
     df = DATA[case_type]
     if case_type == "criminal_litigation":
         filtered = apply_criminal_filters(df, params, logic_dict)
         stats = criminal_stats(filtered)
-        charts = criminal_charts(filtered)
+        charts = criminal_charts(filtered, params)
     elif case_type == "civil_litigation":
         filtered = apply_civil_filters(df, params, logic_dict)
         stats = civil_stats(filtered)
         charts = civil_charts(filtered)
-    elif case_type == "civil_nonlitig":
-        filtered = apply_nonlitig_filters(df, params, logic_dict)
-        stats = nonlitig_stats(filtered)
-        charts = nonlitig_charts(filtered)
     elif case_type == "family_litigation":
         filtered = apply_family_filters(df, params, logic_dict)
         stats = family_stats(filtered)
