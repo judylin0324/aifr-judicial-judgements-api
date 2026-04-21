@@ -7,12 +7,22 @@ from pathlib import Path
 from typing import Optional
 from collections import Counter, defaultdict
 import pandas as pd
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI(title="裁判書量化實證研究 API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Middleware to fix double-slash paths (e.g. //api/types -> /api/types)
+class NormalizePathMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if "//" in request.scope["path"]:
+            request.scope["path"] = re.sub(r"/+", "/", request.scope["path"])
+        return await call_next(request)
+
+app.add_middleware(NormalizePathMiddleware)
 
 # ════════════════════════════════════════════════════════════
 #  Flag / Keyword Definitions
@@ -279,8 +289,10 @@ def _build_dual_axis_bar(df, group_col, segment_col, top_n=8):
 # ════════════════════════════════════════════════════════════
 #  Court Map Data Builder
 # ════════════════════════════════════════════════════════════
-def _build_court_map(df, court_col, category_col=None, lawyer_col=None, ending_col=None, top_cats=5):
-    """Build per-court statistics for map visualization."""
+def _build_court_map(df, court_col, category_col=None, lawyer_col=None, ending_col=None, top_cats=5, extra_fn=None):
+    """Build per-court statistics for map visualization.
+    extra_fn(sub, count) -> dict of extra fields to merge into info.
+    """
     if court_col not in df.columns:
         return []
     courts = df[court_col].value_counts()
@@ -293,18 +305,27 @@ def _build_court_map(df, court_col, category_col=None, lawyer_col=None, ending_c
         sub = df[df[court_col] == court]
         # Top categories
         if category_col and category_col in sub.columns:
-            cat_counts = sub[category_col].value_counts().head(top_cats)
-            info["topCats"] = [{"name": k, "count": int(v), "pct": round(float(v / count) * 100, 1)} for k, v in cat_counts.items() if clean(k)]
+            cat_counts = sub[category_col].value_counts()
+            # Take top N non-其他, then append 其他 at end
+            top_items = []
+            other_count = 0
+            for k, v in cat_counts.items():
+                if not clean(k):
+                    continue
+                if k == "其他":
+                    other_count = int(v)
+                elif len(top_items) < top_cats:
+                    top_items.append({"name": k, "count": int(v), "pct": round(float(v / count) * 100, 1)})
+            if other_count > 0:
+                top_items.append({"name": "其他", "count": other_count, "pct": round(float(other_count / count) * 100, 1)})
+            info["topCats"] = top_items
         # Lawyer rate
         if lawyer_col and lawyer_col in sub.columns:
             with_lawyer = int((sub[lawyer_col] != "雙方無律師").sum())
             info["lawyerRate"] = round(float(with_lawyer / count) * 100, 1) if count else 0
-            # Win rate with vs without lawyer
-            if ending_col and ending_col in sub.columns:
-                has_l = sub[sub[lawyer_col] != "雙方無律師"]
-                no_l = sub[sub[lawyer_col] == "雙方無律師"]
-                info["withLawyerWinRate"] = round(float((has_l[ending_col] == "勝訴").sum() / len(has_l)) * 100, 1) if len(has_l) else 0
-                info["noLawyerWinRate"] = round(float((no_l[ending_col] == "勝訴").sum() / len(no_l)) * 100, 1) if len(no_l) else 0
+        # Extra function for custom per-court stats
+        if extra_fn:
+            info.update(extra_fn(sub, count))
         result.append(info)
     return result
 
@@ -522,28 +543,63 @@ def civil_stats(df):
         lawyer_rate = round(float(with_lawyer / total) * 100, 1)
     return {"judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0, "lawyerRate": lawyer_rate}
 
+def _civil_top_causes(df, cause_col="c0_案由", top_n=5):
+    """Extract top N most common cause keywords from c0_案由 (full text, not action/subject split)."""
+    if cause_col not in df.columns:
+        return df.assign(_cause_top=lambda x: "其他") if len(df) else df
+    # Use the original c0_案由 to find the most common full-text patterns
+    all_keywords = CIVIL_ACTIONS + CIVIL_SUBJECTS
+    cause_counts = Counter()
+    for text in df[cause_col]:
+        t = str(text or "")
+        matched = False
+        for kw in all_keywords:
+            if kw in t:
+                cause_counts[kw] += 1
+                matched = True
+                break
+        if not matched:
+            cause_counts["其他"] += 1
+    # Top N keywords (excluding 其他)
+    top_kws = [k for k, _ in cause_counts.most_common() if k != "其他"][:top_n]
+    def classify(text):
+        t = str(text or "")
+        for kw in top_kws:
+            if kw in t:
+                return kw
+        return "其他"
+    return df.assign(_cause_top=df[cause_col].apply(classify))
+
 def civil_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    # Court map data
-    charts["courtMap"] = _build_court_map(df, court_col, "_subject", "律師代理情形", "終結情形大分類")
-    # Amount × Lawyer heatmap (sorted by amount)
+    # Lawyer × Ending dual-axis bar (Chart 1)
+    if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
+        charts["lawyerEndingBar"] = _build_dual_axis_bar(df, "律師代理情形", "終結情形大分類")
+    # Court map data (Chart 2) — top 5 causes (not split by action/subject), no win rates
+    cause_col = "c0_案由" if "c0_案由" in df.columns else ""
+    if cause_col:
+        df_with_cause = _civil_top_causes(df, cause_col, top_n=5)
+        charts["courtMap"] = _build_court_map(df_with_cause, court_col, "_cause_top", "律師代理情形")
+    else:
+        charts["courtMap"] = _build_court_map(df, court_col, None, "律師代理情形")
+    # Amount × Lawyer heatmap (Chart 3, sorted by amount)
     if "訴訟標的金額級距" in df.columns and "律師代理情形" in df.columns:
         amt_order = ["<10萬", "10-50萬", "50-100萬", "100-500萬", "500-1000萬", ">1000萬"]
         hm = _build_heatmap(df, "律師代理情形", "訴訟標的金額級距", x_limit=6, y_limit=8)
-        # Reorder y-axis by amount order
         if hm["yLabels"]:
             ordered_y = [a for a in amt_order if a in hm["yLabels"]]
-            remaining = [y for y in hm["yLabels"] if y not in ordered_y]
+            remaining = [y for y in hm["yLabels"] if y not in ordered_y and y != "其他"]
+            if "其他" in hm["yLabels"]: remaining.append("其他")
             new_y = ordered_y + remaining
             old_y_idx = {y: i for i, y in enumerate(hm["yLabels"])}
             new_matrix = [hm["matrix"][old_y_idx[y]] for y in new_y if y in old_y_idx]
             hm["yLabels"] = [y for y in new_y if y in old_y_idx]
             hm["matrix"] = new_matrix
         charts["amountLawyerHeatmap"] = hm
-    # Lawyer × Ending dual-axis bar
-    if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
-        charts["lawyerEndingBar"] = _build_dual_axis_bar(df, "律師代理情形", "終結情形大分類")
+    # Action heatmap and Subject heatmap (Chart 4) — 其他 always last (already handled by _build_heatmap)
+    if "_action" in df.columns and "_subject" in df.columns:
+        charts["actionSubjectHeatmap"] = _build_heatmap(df, "_subject", "_action", x_limit=10, y_limit=10)
     return charts
 
 # ════════════════════════════════════════════════════════════
@@ -590,31 +646,74 @@ def family_stats(df):
 def family_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    # Divorce court map
-    divorce_sub = df[df["案由大分類"] == "離婚"] if "案由大分類" in df.columns else pd.DataFrame()
     reason_col = "離婚原因" if "離婚原因" in df.columns else "c0_離婚原因"
     init_col = "主動離婚者" if "主動離婚者" in df.columns else "c0_主動離婚者"
-    charts["divorceCourtMap"] = _build_court_map(divorce_sub, court_col, reason_col, "律師代理情形", "終結情形大分類") if not divorce_sub.empty else []
-    # Divorce analysis
-    divorce_analysis = {"reasonDist": [], "initiatorDist": [], "endingDist": []}
+    divorce_sub = df[df["案由大分類"] == "離婚"] if "案由大分類" in df.columns else pd.DataFrame()
+    inherit_sub = df[df["案由大分類"] == "繼承"] if "案由大分類" in df.columns else pd.DataFrame()
+
+    # Chart 1: Lawyer × Cause dual-axis bar
+    if "律師代理情形" in df.columns and "案由大分類" in df.columns:
+        charts["lawyerCauseBar"] = _build_dual_axis_bar(df, "律師代理情形", "案由大分類")
+
+    # Chart 2: Cause distribution (案由 with 其他 split out)
+    if "案由大分類" in df.columns:
+        cause_counts = df[df["案由大分類"].str.strip() != ""]["案由大分類"].value_counts()
+        charts["causeDist"] = [{"name": k, "count": int(v)} for k, v in cause_counts.items() if clean(k)]
+
+    # Chart 3: Court map — divorce/inherit toggle, with initiator lawyer rates
+    # Divorce map: per-court stats + per-initiator lawyer rates
+    def _divorce_extra(sub, count):
+        extra = {}
+        if init_col in sub.columns and "律師代理情形" in sub.columns:
+            rates = {}
+            for initiator in ["男方", "女方", "雙方"]:
+                init_sub = sub[sub[init_col] == initiator]
+                if len(init_sub) > 0:
+                    with_l = (init_sub["律師代理情形"] != "雙方無律師").sum()
+                    rates[initiator] = round(float(with_l / len(init_sub)) * 100, 1)
+            extra["initiatorLawyerRates"] = rates
+        return extra
+
+    def _inherit_extra(sub, count):
+        extra = {}
+        if "律師代理情形" in sub.columns:
+            with_l = (sub["律師代理情形"] != "雙方無律師").sum()
+            extra["lawyerRate"] = round(float(with_l / count) * 100, 1) if count else 0
+        return extra
+
+    charts["divorceCourtMap"] = _build_court_map(
+        divorce_sub, court_col, None, "律師代理情形", None, extra_fn=_divorce_extra
+    ) if not divorce_sub.empty else []
+    charts["inheritCourtMap"] = _build_court_map(
+        inherit_sub, court_col, None, "律師代理情形", None, extra_fn=_inherit_extra
+    ) if not inherit_sub.empty else []
+    charts["divorceTotal"] = len(divorce_sub)
+    charts["inheritTotal"] = len(inherit_sub)
+
+    # Chart 4: Divorce analysis — initiator pie + cross-analysis (initiator × reason, stacked by ending)
+    divorce_analysis = {"initiatorDist": [], "crossAnalysis": []}
     if not divorce_sub.empty:
-        if reason_col in divorce_sub.columns:
-            rc = divorce_sub[divorce_sub[reason_col].str.strip() != ""][reason_col].value_counts()
-            divorce_analysis["reasonDist"] = [{"name": k, "count": int(v)} for k, v in rc.items()]
+        # Initiator distribution (pie chart)
         if init_col in divorce_sub.columns:
             ic = divorce_sub[divorce_sub[init_col].str.strip() != ""][init_col].value_counts()
             divorce_analysis["initiatorDist"] = [{"name": k, "count": int(v)} for k, v in ic.items()]
-        if "終結情形大分類" in divorce_sub.columns:
-            ec = divorce_sub["終結情形大分類"].value_counts()
-            divorce_analysis["endingDist"] = [{"name": k, "count": int(v)} for k, v in ec.items() if clean(k)]
+        # Cross-analysis: for each initiator, show reason distribution stacked by ending
+        if init_col in divorce_sub.columns and reason_col in divorce_sub.columns and "終結情形大分類" in divorce_sub.columns:
+            cross = []
+            for initiator in ["男方", "女方", "雙方"]:
+                init_sub = divorce_sub[divorce_sub[init_col] == initiator]
+                if init_sub.empty:
+                    continue
+                reason_ending = init_sub[init_sub[reason_col].str.strip() != ""]
+                if reason_ending.empty:
+                    continue
+                # Build stacked bar: group by reason, segment by ending
+                cross.append({
+                    "initiator": initiator,
+                    "stack": _build_stacked_bar(reason_ending, reason_col, "終結情形大分類", top_n=6)
+                })
+            divorce_analysis["crossAnalysis"] = cross
     charts["divorceAnalysis"] = divorce_analysis
-    # Inheritance court map
-    inherit_sub = df[df["案由大分類"] == "繼承"] if "案由大分類" in df.columns else pd.DataFrame()
-    charts["inheritCourtMap"] = _build_court_map(inherit_sub, court_col, "案由大分類", "律師代理情形", "終結情形大分類") if not inherit_sub.empty else []
-    charts["inheritTotal"] = len(inherit_sub)
-    # Lawyer × Cause dual-axis bar
-    if "律師代理情形" in df.columns and "案由大分類" in df.columns:
-        charts["lawyerCauseBar"] = _build_dual_axis_bar(df, "律師代理情形", "案由大分類")
     return charts
 
 # ════════════════════════════════════════════════════════════
