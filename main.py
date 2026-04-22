@@ -534,7 +534,7 @@ def criminal_charts(df, params=None):
     # Law stacked bar
     if "定罪法條" in df.columns and "_ag_mit" in df.columns:
         charts["lawStack"] = _build_stacked_bar(df, "定罪法條", "_ag_mit", top_n=8)
-    # Violin with outliers
+    # Violin with outliers (values = inliers only for density, outliers separate)
     violin = []
     if "定罪法條" in df.columns and "c11_宣告有期徒刑" in df.columns:
         top_laws = [l for l, _ in Counter(df[df["定罪法條"].str.strip() != ""]["定罪法條"]).most_common(8)]
@@ -545,10 +545,20 @@ def criminal_charts(df, params=None):
                 s = sorted(vals)
                 bs = box_stats(s)
                 outliers = bs["outliers"] if bs else []
+                # Separate inliers for violin density (exclude outliers)
+                outlier_set = set()
+                if bs:
+                    lf = bs["q1"] - 1.5 * bs["iqr"]
+                    uf = bs["q3"] + 1.5 * bs["iqr"]
+                    inliers = [v for v in s if lf <= v <= uf]
+                else:
+                    inliers = s
+                # Sample outliers if too many (max 100 for rendering)
+                sampled_outliers = outliers if len(outliers) <= 100 else [outliers[i] for i in range(0, len(outliers), max(1, len(outliers) // 100))][:100]
                 violin.append({
-                    "name": law, "values": s, "mean": sum(s)/len(s),
+                    "name": law, "values": inliers, "mean": sum(s)/len(s),
                     "median": quantile(s, 0.5), "n": len(s),
-                    "outliers": outliers,
+                    "outliers": sampled_outliers, "outlierCount": len(outliers),
                     "q1": bs["q1"] if bs else 0, "q3": bs["q3"] if bs else 0,
                     "whiskerLow": bs["whiskerLow"] if bs else s[0],
                     "whiskerHigh": bs["whiskerHigh"] if bs else s[-1],
@@ -732,6 +742,7 @@ def _build_family_court_bar(sub_df, court_col, init_col=None, lawyer_col="律師
             court_order.append(c)
     data = []
     lawyer_lines = {"男方": [], "女方": [], "雙方": []}  # for divorce
+    initiator_totals = {"男方": 0, "女方": 0, "雙方": 0}  # total cases per initiator
     for court in court_order:
         court_sub = filtered[filtered[court_col] == court]
         row = {"court": court, "abbr": COURT_ABBR.get(court, court.replace("地方法院", "")), "total": int(len(court_sub))}
@@ -743,6 +754,7 @@ def _build_family_court_bar(sub_df, court_col, init_col=None, lawyer_col="律師
         if init_col and init_col in court_sub.columns and lawyer_col in court_sub.columns:
             for initiator in ["男方", "女方", "雙方"]:
                 i_sub = court_sub[court_sub[init_col] == initiator]
+                initiator_totals[initiator] += len(i_sub)
                 if len(i_sub) > 0:
                     with_l = (i_sub[lawyer_col] != "雙方無律師").sum()
                     rate = round(float(with_l / len(i_sub)) * 100, 1)
@@ -754,7 +766,8 @@ def _build_family_court_bar(sub_df, court_col, init_col=None, lawyer_col="律師
             with_l = int((court_sub[lawyer_col] != "雙方無律師").sum())
             row["lawyerRate"] = round(float(with_l / len(court_sub)) * 100, 1) if len(court_sub) > 0 else 0
         data.append(row)
-    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data, "lawyerLines": lawyer_lines}
+    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data,
+            "lawyerLines": lawyer_lines, "initiatorTotals": initiator_totals}
 
 def family_charts(df):
     charts = {}
