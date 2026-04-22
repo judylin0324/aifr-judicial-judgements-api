@@ -77,14 +77,37 @@ CRIME_FLAGS = [
 ]
 AG_MIT_CATS = ["無加重無減輕", "僅有加重法條", "僅有減輕法條", "有加重有減輕"]
 
+# North-to-south court ordering (for bar charts)
+COURT_N2S = [
+    "基隆地方法院", "士林地方法院", "臺北地方法院", "新北地方法院",
+    "桃園地方法院", "新竹地方法院", "苗栗地方法院", "臺中地方法院",
+    "南投地方法院", "彰化地方法院", "雲林地方法院", "嘉義地方法院",
+    "臺南地方法院", "橋頭地方法院", "高雄地方法院", "屏東地方法院",
+    "宜蘭地方法院", "花蓮地方法院", "臺東地方法院",
+    "澎湖地方法院", "金門地方法院", "連江地方法院",
+    "福建金門地方法院", "福建連江地方法院",
+]
+COURT_ABBR = {
+    "臺北地方法院": "臺北", "新北地方法院": "新北", "士林地方法院": "士林",
+    "桃園地方法院": "桃園", "新竹地方法院": "新竹", "苗栗地方法院": "苗栗",
+    "臺中地方法院": "臺中", "南投地方法院": "南投", "彰化地方法院": "彰化",
+    "雲林地方法院": "雲林", "嘉義地方法院": "嘉義", "臺南地方法院": "臺南",
+    "高雄地方法院": "高雄", "橋頭地方法院": "橋頭", "屏東地方法院": "屏東",
+    "宜蘭地方法院": "宜蘭", "花蓮地方法院": "花蓮", "臺東地方法院": "臺東",
+    "基隆地方法院": "基隆", "澎湖地方法院": "澎湖", "金門地方法院": "金門",
+    "連江地方法院": "連江", "福建金門地方法院": "金門", "福建連江地方法院": "連江",
+}
+
 # Expanded civil keyword lists
-CIVIL_ACTIONS = ["侵權行為", "損害賠償", "國家賠償", "代位請求", "債務人異議", "分配表異議",
+# Note: 損害賠償 split → 賠償(action), 損害(subject); 侵權行為 split → 侵權(action), 行為(subject)
+CIVIL_ACTIONS = ["國家賠償", "代位請求", "債務人異議", "分配表異議",
     "拆屋還地", "塗銷", "清償", "給付", "返還", "確認", "分割", "撤銷", "除權",
-    "遷讓", "履行", "拍賣", "再審"]
+    "遷讓", "履行", "拍賣", "再審", "賠償", "侵權"]
 CIVIL_SUBJECTS = ["簽帳卡", "信用卡", "現金卡", "借款", "消費借貸", "債務", "消費款",
     "票款", "電信費", "不當得利", "房屋", "管理費", "貨款", "遺產", "工程款",
     "土地", "租金", "保險", "本票", "股票", "買賣價金", "薪資", "資遣費",
-    "抵押", "共有物", "契約"]
+    "抵押", "共有物", "契約", "損害", "行為", "動產", "不動產", "所有權",
+    "使用借貸", "委任", "承攬", "合夥", "支付命令", "職業災害", "車禍"]
 
 # ════════════════════════════════════════════════════════════
 #  Data Loading
@@ -125,6 +148,9 @@ def _preprocess(key, df):
             cat[~ha & hm] = "僅有減輕法條"
             cat[ha & hm] = "有加重有減輕"
             df["_ag_mit"] = cat
+        # Map blank 裁判程序 to 通常判決
+        if "c1_裁判程序" in df.columns:
+            df.loc[df["c1_裁判程序"].str.strip() == "", "c1_裁判程序"] = "通常判決"
         prb_col = "c1_是否宣告緩刑" if "c1_是否宣告緩刑" in df.columns else None
         if prb_col:
             df["_probation"] = df[prb_col].map({"1": "有緩刑", "0": "無緩刑"}).fillna("")
@@ -245,27 +271,51 @@ def _build_heatmap(df, x_col, y_col, x_limit=8, y_limit=8):
         matrix.append(row)
     return {"xLabels": x_labels, "yLabels": y_labels, "matrix": matrix, "max": max_val}
 
-def _build_court_class_bar(df, court_col="c0_法院別", class_col="案件分類"):
-    """Build stacked vertical bar data: X=courts (all), segments=case classes."""
+def _build_court_class_bar(df, court_col="c0_法院別", class_col="案件分類", params=None):
+    """Build stacked vertical bar data: X=courts (N→S), segments=case classes.
+    If single court is selected, switch to 終結年月 × 案件分類.
+    """
     filtered = df[(df[court_col].str.strip() != "") & (df[class_col].str.strip() != "")]
     if filtered.empty:
-        return {"courts": [], "segments": [], "data": []}
+        return {"courts": [], "segments": [], "data": [], "mode": "court"}
     segments = [s for s, _ in Counter(filtered[class_col]).most_common()]
-    court_order = [c for c, _ in Counter(filtered[court_col]).most_common()]
-    ABBR = {
-        "臺北地方法院": "臺北", "新北地方法院": "新北", "士林地方法院": "士林",
-        "桃園地方法院": "桃園", "新竹地方法院": "新竹", "苗栗地方法院": "苗栗",
-        "臺中地方法院": "臺中", "南投地方法院": "南投", "彰化地方法院": "彰化",
-        "雲林地方法院": "雲林", "嘉義地方法院": "嘉義", "臺南地方法院": "臺南",
-        "高雄地方法院": "高雄", "橋頭地方法院": "橋頭", "屏東地方法院": "屏東",
-        "宜蘭地方法院": "宜蘭", "花蓮地方法院": "花蓮", "臺東地方法院": "臺東",
-        "基隆地方法院": "基隆", "澎湖地方法院": "澎湖", "金門地方法院": "金門",
-        "連江地方法院": "連江", "福建金門地方法院": "金門", "福建連江地方法院": "連江",
-    }
+
+    # Check if single court is selected
+    court_vals = params.get("court", "").split(",") if params and params.get("court") else []
+    court_vals = [v.strip() for v in court_vals if v.strip()]
+    if len(court_vals) == 1:
+        # Switch to month view: X = 終結年月, segments = 案件分類
+        y_col = "終結年" if "終結年" in df.columns else "c0_全案終結日期-年"
+        m_col = "終結月" if "終結月" in df.columns else "c0_全案終結日期-月"
+        if y_col in df.columns and m_col in df.columns:
+            filtered = filtered.copy()
+            filtered["_ym"] = filtered[y_col].str.zfill(3) + "/" + filtered[m_col].str.zfill(2)
+            ym_order = sorted(filtered["_ym"].unique())
+            data = []
+            for ym in ym_order:
+                sub = filtered[filtered["_ym"] == ym]
+                row = {"court": ym, "abbr": ym, "total": int(len(sub))}
+                counts = {}
+                for seg in segments:
+                    c = int(len(sub[sub[class_col] == seg]))
+                    row[seg] = c
+                    counts[seg] = c
+                row["__counts"] = counts
+                data.append(row)
+            return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data,
+                    "mode": "month", "courtName": COURT_ABBR.get(court_vals[0], court_vals[0].replace("地方法院", ""))}
+
+    # Normal mode: N→S court ordering
+    existing_courts = set(filtered[court_col].unique())
+    court_order = [c for c in COURT_N2S if c in existing_courts]
+    # Add any courts not in the N→S list
+    for c in sorted(existing_courts):
+        if c not in court_order:
+            court_order.append(c)
     data = []
     for court in court_order:
         sub = filtered[filtered[court_col] == court]
-        row = {"court": court, "abbr": ABBR.get(court, court.replace("地方法院", "")), "total": int(len(sub))}
+        row = {"court": court, "abbr": COURT_ABBR.get(court, court.replace("地方法院", "")), "total": int(len(sub))}
         counts = {}
         for seg in segments:
             c = int(len(sub[sub[class_col] == seg]))
@@ -273,7 +323,7 @@ def _build_court_class_bar(df, court_col="c0_法院別", class_col="案件分類
             counts[seg] = c
         row["__counts"] = counts
         data.append(row)
-    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data}
+    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data, "mode": "court"}
 
 def _build_stacked_bar(df, group_col, segment_col, top_n=8):
     filtered = df[(df[group_col].str.strip() != "") & (df[segment_col].str.strip() != "")]
@@ -477,14 +527,14 @@ def criminal_stats(df):
 
 def criminal_charts(df, params=None):
     charts = {}
-    # Court × Class stacked bar (all courts)
+    # Court × Class stacked bar (all courts, N→S)
     if "c0_法院別" in df.columns and "案件分類" in df.columns:
-        charts["courtClassBar"] = _build_court_class_bar(df, "c0_法院別", "案件分類")
+        charts["courtClassBar"] = _build_court_class_bar(df, "c0_法院別", "案件分類", params)
 
     # Law stacked bar
     if "定罪法條" in df.columns and "_ag_mit" in df.columns:
         charts["lawStack"] = _build_stacked_bar(df, "定罪法條", "_ag_mit", top_n=8)
-    # Violin
+    # Violin with outliers
     violin = []
     if "定罪法條" in df.columns and "c11_宣告有期徒刑" in df.columns:
         top_laws = [l for l, _ in Counter(df[df["定罪法條"].str.strip() != ""]["定罪法條"]).most_common(8)]
@@ -493,24 +543,17 @@ def criminal_charts(df, params=None):
             vals = sub["c11_宣告有期徒刑"].apply(parse_months).dropna().tolist()
             if vals:
                 s = sorted(vals)
-                violin.append({"name": law, "values": s, "mean": sum(s)/len(s), "median": quantile(s, 0.5), "n": len(s)})
+                bs = box_stats(s)
+                outliers = bs["outliers"] if bs else []
+                violin.append({
+                    "name": law, "values": s, "mean": sum(s)/len(s),
+                    "median": quantile(s, 0.5), "n": len(s),
+                    "outliers": outliers,
+                    "q1": bs["q1"] if bs else 0, "q3": bs["q3"] if bs else 0,
+                    "whiskerLow": bs["whiskerLow"] if bs else s[0],
+                    "whiskerHigh": bs["whiskerHigh"] if bs else s[-1],
+                })
     charts["violin"] = violin
-    # Box-whisker
-    box_data = []
-    if "定罪法條" in df.columns and "c11_宣告有期徒刑" in df.columns:
-        top_laws = [l for l, _ in Counter(df[df["定罪法條"].str.strip() != ""]["定罪法條"]).most_common(8)]
-        for law in top_laws:
-            sub = df[df["定罪法條"] == law]
-            vals = sub["c11_宣告有期徒刑"].apply(parse_months).dropna().tolist()
-            if vals:
-                bs = box_stats(vals)
-                if bs:
-                    dominant = "無加重無減輕"
-                    if "_ag_mit" in sub.columns:
-                        am_counts = sub["_ag_mit"].value_counts()
-                        if len(am_counts) > 0: dominant = am_counts.index[0]
-                    box_data.append({"law": law, "n": len(vals), "dominant": dominant, **bs})
-    charts["boxWhisker"] = box_data
     return charts
 
 # ════════════════════════════════════════════════════════════
@@ -587,23 +630,35 @@ def _civil_top_causes(df, cause_col="c0_案由", top_n=5):
         return "其他"
     return df.assign(_cause_top=df[cause_col].apply(classify))
 
+def _build_lawyer_rate_map(df, court_col):
+    """Build per-court lawyer representation rate map. Color/size = per-court lawyer rate."""
+    if court_col not in df.columns or "律師代理情形" not in df.columns:
+        return []
+    courts = df[court_col].value_counts()
+    result = []
+    for court, count in courts.items():
+        if not clean(court):
+            continue
+        sub = df[df[court_col] == court]
+        with_lawyer = int((sub["律師代理情形"] != "雙方無律師").sum())
+        rate = round(float(with_lawyer / count) * 100, 1) if count else 0
+        result.append({
+            "court": court, "count": int(count), "lawyerRate": rate,
+        })
+    return result
+
 def civil_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
     # Lawyer × Ending dual-axis bar (Chart 1)
     if "律師代理情形" in df.columns and "終結情形大分類" in df.columns:
         charts["lawyerEndingBar"] = _build_dual_axis_bar(df, "律師代理情形", "終結情形大分類")
-    # Court map data (Chart 2) — top 5 causes (not split by action/subject), no win rates
-    cause_col = "c0_案由" if "c0_案由" in df.columns else ""
-    if cause_col:
-        df_with_cause = _civil_top_causes(df, cause_col, top_n=5)
-        charts["courtMap"] = _build_court_map(df_with_cause, court_col, "_cause_top", "律師代理情形")
-    else:
-        charts["courtMap"] = _build_court_map(df, court_col, None, "律師代理情形")
+    # Court lawyer rate map (Chart 2) — color/size by per-court lawyer rate
+    charts["lawyerRateMap"] = _build_lawyer_rate_map(df, court_col)
     # Amount × Lawyer heatmap (Chart 3, sorted by amount)
     if "訴訟標的金額級距" in df.columns and "律師代理情形" in df.columns:
-        amt_order = ["<10萬", "10-50萬", "50-100萬", "100-500萬", "500-1000萬", ">1000萬"]
-        hm = _build_heatmap(df, "律師代理情形", "訴訟標的金額級距", x_limit=6, y_limit=8)
+        amt_order = ["<10萬", "10-50萬", "50-100萬", "100-500萬", "500萬-1000萬", "500-1000萬", ">1000萬", "1000萬以上"]
+        hm = _build_heatmap(df, "律師代理情形", "訴訟標的金額級距", x_limit=8, y_limit=10)
         if hm["yLabels"]:
             ordered_y = [a for a in amt_order if a in hm["yLabels"]]
             remaining = [y for y in hm["yLabels"] if y not in ordered_y and y != "其他"]
@@ -614,9 +669,9 @@ def civil_charts(df):
             hm["yLabels"] = [y for y in new_y if y in old_y_idx]
             hm["matrix"] = new_matrix
         charts["amountLawyerHeatmap"] = hm
-    # Action heatmap and Subject heatmap (Chart 4) — 其他 always last (already handled by _build_heatmap)
+    # Action × Subject heatmap (Chart 4)
     if "_action" in df.columns and "_subject" in df.columns:
-        charts["actionSubjectHeatmap"] = _build_heatmap(df, "_subject", "_action", x_limit=10, y_limit=10)
+        charts["actionSubjectHeatmap"] = _build_heatmap(df, "_subject", "_action", x_limit=12, y_limit=12)
     return charts
 
 # ════════════════════════════════════════════════════════════
@@ -660,10 +715,50 @@ def family_stats(df):
         divorce_rate = round(float(divorce_cases / total) * 100, 1)
     return {"judgmentCount": int(df[jid_col].nunique()) if jid_col in df.columns else 0, "lawyerRate": lawyer_rate, "divorceRate": divorce_rate}
 
+def _build_family_court_bar(sub_df, court_col, init_col=None, lawyer_col="律師代理情形", cause_col="案由大分類"):
+    """Build stacked bar by court (N→S) for family cases + initiator lawyer rate lines."""
+    if court_col not in sub_df.columns:
+        return {"courts": [], "segments": [], "data": [], "lawyerLines": {}}
+    filtered = sub_df[sub_df[court_col].str.strip() != ""]
+    if filtered.empty:
+        return {"courts": [], "segments": [], "data": [], "lawyerLines": {}}
+    # For family, use a single "案件" segment (all same cause type)
+    segments = ["案件"]
+    # N→S ordering
+    existing = set(filtered[court_col].unique())
+    court_order = [c for c in COURT_N2S if c in existing]
+    for c in sorted(existing):
+        if c not in court_order:
+            court_order.append(c)
+    data = []
+    lawyer_lines = {"男方": [], "女方": [], "雙方": []}  # for divorce
+    for court in court_order:
+        court_sub = filtered[filtered[court_col] == court]
+        row = {"court": court, "abbr": COURT_ABBR.get(court, court.replace("地方法院", "")), "total": int(len(court_sub))}
+        counts = {}
+        row["案件"] = int(len(court_sub))
+        counts["案件"] = int(len(court_sub))
+        row["__counts"] = counts
+        # Initiator lawyer rates (for divorce)
+        if init_col and init_col in court_sub.columns and lawyer_col in court_sub.columns:
+            for initiator in ["男方", "女方", "雙方"]:
+                i_sub = court_sub[court_sub[init_col] == initiator]
+                if len(i_sub) > 0:
+                    with_l = (i_sub[lawyer_col] != "雙方無律師").sum()
+                    rate = round(float(with_l / len(i_sub)) * 100, 1)
+                else:
+                    rate = None
+                lawyer_lines[initiator].append(rate)
+        # General lawyer rate (for inherit)
+        if lawyer_col in court_sub.columns:
+            with_l = int((court_sub[lawyer_col] != "雙方無律師").sum())
+            row["lawyerRate"] = round(float(with_l / len(court_sub)) * 100, 1) if len(court_sub) > 0 else 0
+        data.append(row)
+    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data, "lawyerLines": lawyer_lines}
+
 def family_charts(df):
     charts = {}
     court_col = "法院別" if "法院別" in df.columns else "c0_法院別"
-    reason_col = "離婚原因" if "離婚原因" in df.columns else "c0_離婚原因"
     init_col = "主動離婚者" if "主動離婚者" in df.columns else "c0_主動離婚者"
     divorce_sub = df[df["案由大分類"] == "離婚"] if "案由大分類" in df.columns else pd.DataFrame()
     inherit_sub = df[df["案由大分類"] == "繼承"] if "案由大分類" in df.columns else pd.DataFrame()
@@ -672,65 +767,28 @@ def family_charts(df):
     if "律師代理情形" in df.columns and "案由大分類" in df.columns:
         charts["lawyerCauseBar"] = _build_dual_axis_bar(df, "律師代理情形", "案由大分類")
 
-    # Chart 2: Cause distribution (案由 with 其他 split out)
+    # Chart 2: Cause distribution + initiator pie below
     if "案由大分類" in df.columns:
         cause_counts = df[df["案由大分類"].str.strip() != ""]["案由大分類"].value_counts()
         charts["causeDist"] = [{"name": k, "count": int(v)} for k, v in cause_counts.items() if clean(k)]
 
-    # Chart 3: Court map — divorce/inherit toggle, with initiator lawyer rates
-    # Divorce map: per-court stats + per-initiator lawyer rates
-    def _divorce_extra(sub, count):
-        extra = {}
-        if init_col in sub.columns and "律師代理情形" in sub.columns:
-            rates = {}
-            for initiator in ["男方", "女方", "雙方"]:
-                init_sub = sub[sub[init_col] == initiator]
-                if len(init_sub) > 0:
-                    with_l = (init_sub["律師代理情形"] != "雙方無律師").sum()
-                    rates[initiator] = round(float(with_l / len(init_sub)) * 100, 1)
-            extra["initiatorLawyerRates"] = rates
-        return extra
+    # Initiator distribution (pie chart — moved under causeDist)
+    initiator_dist = []
+    if not divorce_sub.empty and init_col in divorce_sub.columns:
+        ic = divorce_sub[divorce_sub[init_col].str.strip() != ""][init_col].value_counts()
+        initiator_dist = [{"name": k, "count": int(v)} for k, v in ic.items()]
+    charts["initiatorDist"] = initiator_dist
 
-    def _inherit_extra(sub, count):
-        extra = {}
-        if "律師代理情形" in sub.columns:
-            with_l = (sub["律師代理情形"] != "雙方無律師").sum()
-            extra["lawyerRate"] = round(float(with_l / count) * 100, 1) if count else 0
-        return extra
-
-    charts["divorceCourtMap"] = _build_court_map(
-        divorce_sub, court_col, None, "律師代理情形", None, extra_fn=_divorce_extra
-    ) if not divorce_sub.empty else []
-    charts["inheritCourtMap"] = _build_court_map(
-        inherit_sub, court_col, None, "律師代理情形", None, extra_fn=_inherit_extra
-    ) if not inherit_sub.empty else []
+    # Chart 3: Court stacked bar (divorce/inherit toggle) + lawyer rate lines
+    charts["divorceCourtBar"] = _build_family_court_bar(
+        divorce_sub, court_col, init_col=init_col
+    ) if not divorce_sub.empty else {"courts": [], "segments": [], "data": [], "lawyerLines": {}}
+    charts["inheritCourtBar"] = _build_family_court_bar(
+        inherit_sub, court_col, init_col=None
+    ) if not inherit_sub.empty else {"courts": [], "segments": [], "data": [], "lawyerLines": {}}
     charts["divorceTotal"] = len(divorce_sub)
     charts["inheritTotal"] = len(inherit_sub)
 
-    # Chart 4: Divorce analysis — initiator pie + cross-analysis (initiator × reason, stacked by ending)
-    divorce_analysis = {"initiatorDist": [], "crossAnalysis": []}
-    if not divorce_sub.empty:
-        # Initiator distribution (pie chart)
-        if init_col in divorce_sub.columns:
-            ic = divorce_sub[divorce_sub[init_col].str.strip() != ""][init_col].value_counts()
-            divorce_analysis["initiatorDist"] = [{"name": k, "count": int(v)} for k, v in ic.items()]
-        # Cross-analysis: for each initiator, show reason distribution stacked by ending
-        if init_col in divorce_sub.columns and reason_col in divorce_sub.columns and "終結情形大分類" in divorce_sub.columns:
-            cross = []
-            for initiator in ["男方", "女方", "雙方"]:
-                init_sub = divorce_sub[divorce_sub[init_col] == initiator]
-                if init_sub.empty:
-                    continue
-                reason_ending = init_sub[init_sub[reason_col].str.strip() != ""]
-                if reason_ending.empty:
-                    continue
-                # Build stacked bar: group by reason, segment by ending
-                cross.append({
-                    "initiator": initiator,
-                    "stack": _build_stacked_bar(reason_ending, reason_col, "終結情形大分類", top_n=6)
-                })
-            divorce_analysis["crossAnalysis"] = cross
-    charts["divorceAnalysis"] = divorce_analysis
     return charts
 
 # ════════════════════════════════════════════════════════════
