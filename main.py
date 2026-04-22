@@ -245,6 +245,36 @@ def _build_heatmap(df, x_col, y_col, x_limit=8, y_limit=8):
         matrix.append(row)
     return {"xLabels": x_labels, "yLabels": y_labels, "matrix": matrix, "max": max_val}
 
+def _build_court_class_bar(df, court_col="c0_法院別", class_col="案件分類"):
+    """Build stacked vertical bar data: X=courts (all), segments=case classes."""
+    filtered = df[(df[court_col].str.strip() != "") & (df[class_col].str.strip() != "")]
+    if filtered.empty:
+        return {"courts": [], "segments": [], "data": []}
+    segments = [s for s, _ in Counter(filtered[class_col]).most_common()]
+    court_order = [c for c, _ in Counter(filtered[court_col]).most_common()]
+    ABBR = {
+        "臺北地方法院": "臺北", "新北地方法院": "新北", "士林地方法院": "士林",
+        "桃園地方法院": "桃園", "新竹地方法院": "新竹", "苗栗地方法院": "苗栗",
+        "臺中地方法院": "臺中", "南投地方法院": "南投", "彰化地方法院": "彰化",
+        "雲林地方法院": "雲林", "嘉義地方法院": "嘉義", "臺南地方法院": "臺南",
+        "高雄地方法院": "高雄", "橋頭地方法院": "橋頭", "屏東地方法院": "屏東",
+        "宜蘭地方法院": "宜蘭", "花蓮地方法院": "花蓮", "臺東地方法院": "臺東",
+        "基隆地方法院": "基隆", "澎湖地方法院": "澎湖", "金門地方法院": "金門",
+        "連江地方法院": "連江", "福建金門地方法院": "金門", "福建連江地方法院": "連江",
+    }
+    data = []
+    for court in court_order:
+        sub = filtered[filtered[court_col] == court]
+        row = {"court": court, "abbr": ABBR.get(court, court.replace("地方法院", "")), "total": int(len(sub))}
+        counts = {}
+        for seg in segments:
+            c = int(len(sub[sub[class_col] == seg]))
+            row[seg] = c
+            counts[seg] = c
+        row["__counts"] = counts
+        data.append(row)
+    return {"courts": [d["abbr"] for d in data], "segments": segments, "data": data}
+
 def _build_stacked_bar(df, group_col, segment_col, top_n=8):
     filtered = df[(df[group_col].str.strip() != "") & (df[segment_col].str.strip() != "")]
     if filtered.empty:
@@ -447,22 +477,9 @@ def criminal_stats(df):
 
 def criminal_charts(df, params=None):
     charts = {}
-    # Auto-select heatmap axes based on filters
-    has_ending_filter = bool(params and params.get("ending"))
-    has_court_filter = bool(params and params.get("court"))
-    has_class_filter = bool(params and params.get("cls"))
-    # Determine best heatmap combination
-    if has_ending_filter and not has_court_filter:
-        hm_x, hm_y = "c0_法院別", "案件分類"
-        hm_title = "案件分類 × 法院別"
-    elif has_court_filter and not has_ending_filter:
-        hm_x, hm_y = "c0_全案終結情形", "案件分類"
-        hm_title = "案件分類 × 終結情形"
-    else:
-        hm_x, hm_y = "c0_全案終結情形", "案件分類"
-        hm_title = "案件分類 × 終結情形"
-    if hm_x in df.columns and hm_y in df.columns:
-        charts["caseHeatmap"] = {**_build_heatmap(df, hm_x, hm_y), "heatmapTitle": hm_title}
+    # Court × Class stacked bar (all courts)
+    if "c0_法院別" in df.columns and "案件分類" in df.columns:
+        charts["courtClassBar"] = _build_court_class_bar(df, "c0_法院別", "案件分類")
 
     # Law stacked bar
     if "定罪法條" in df.columns and "_ag_mit" in df.columns:
